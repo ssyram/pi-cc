@@ -12,7 +12,7 @@ import { resolveUpstreamProxy } from "./proxy-env.ts";
  * Open a raw TCP tunnel to `target` through an HTTP proxy via CONNECT.
  * Resolves with the established socket; the caller owns destroying it.
  */
-export function connectThroughProxy(proxy: URL, target: URL, timeoutMs: number): Promise<net.Socket> {
+export function connectThroughProxy(proxy: URL, target: URL, timeoutMs: number, signal?: AbortSignal): Promise<net.Socket> {
   const targetHost = target.hostname;
   const targetPort = Number(target.port || 443);
   const headers: http.OutgoingHttpHeaders = { host: `${targetHost}:${targetPort}` };
@@ -31,6 +31,7 @@ export function connectThroughProxy(proxy: URL, target: URL, timeoutMs: number):
       path: `${targetHost}:${targetPort}`,
       headers,
       timeout: timeoutMs,
+      signal,
     });
     request.once("connect", (response, socket) => {
       if (response.statusCode === 200) {
@@ -191,6 +192,7 @@ export class TurnRelay {
   private readonly sockets = new Set<Destroyable>();
   private readonly active = new Set<Promise<void>>();
   private cancelled = false;
+  private turnAbort = new AbortController();
   private closed = false;
   private baseUrl?: string;
   private transformRequest?: (body: Buffer) => Buffer;
@@ -244,6 +246,7 @@ export class TurnRelay {
     this.requestBody = undefined;
     this.transformRequest = transformRequest;
     this.requestBetas = requestBetas;
+    this.turnAbort = new AbortController();
     this.cancelled = false;
   }
 
@@ -251,7 +254,10 @@ export class TurnRelay {
   finishTurn(): void {
     if (this.cancelled) return;
     this.cancelled = true;
-    for (const socket of this.sockets) socket.destroy(new Error("Claude Code request aborted"));
+    this.turnAbort.abort();
+    // The caller's AbortSignal carries cancellation; injecting an error here
+    // emits unhandled socket errors while tearing down a CONNECT tunnel.
+    for (const socket of this.sockets) socket.destroy();
     this.sockets.clear();
     this.server.closeAllConnections?.();
   }
@@ -353,8 +359,9 @@ export class TurnRelay {
       const proxy = resolveUpstreamProxy(this.env, this.upstream);
       upstreamAttempted = true;
       if (proxy) {
-        tunnel = await connectThroughProxy(proxy, this.upstream, this.timeoutMs);
+        tunnel = await connectThroughProxy(proxy, this.upstream, this.timeoutMs, this.turnAbort.signal);
         this.sockets.add(tunnel);
+        if (this.cancelled) return;
       }
       // When tunneling through a proxy, send HTTP/1.1 over the TLS-wrapped
       // tunnel socket via http.request: https.request ignores createConnection
