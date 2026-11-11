@@ -1,8 +1,53 @@
 import * as http from "node:http";
 import * as https from "node:https";
+import * as net from "node:net";
+import * as tls from "node:tls";
 import { randomBytes } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import type { AnthropicStreamEvent, NativeContentBlock, NativeMessage } from "./native-types.ts";
+import type { ProxyEnv } from "./proxy-env.ts";
+import { resolveUpstreamProxy } from "./proxy-env.ts";
+
+/**
+ * Open a raw TCP tunnel to `target` through an HTTP proxy via CONNECT.
+ * Resolves with the established socket; the caller owns destroying it.
+ */
+export function connectThroughProxy(proxy: URL, target: URL, timeoutMs: number): Promise<net.Socket> {
+  const targetHost = target.hostname;
+  const targetPort = Number(target.port || 443);
+  const headers: http.OutgoingHttpHeaders = { host: `${targetHost}:${targetPort}` };
+  if (proxy.username || proxy.password) {
+    const credentials = Buffer.from(
+      `${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`,
+    ).toString("base64");
+    headers["proxy-authorization"] = `Basic ${credentials}`;
+  }
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      protocol: proxy.protocol,
+      hostname: proxy.hostname,
+      port: proxy.port || 80,
+      method: "CONNECT",
+      path: `${targetHost}:${targetPort}`,
+      headers,
+      timeout: timeoutMs,
+    });
+    request.once("connect", (response, socket) => {
+      if (response.statusCode === 200) {
+        socket.setTimeout(0);
+        resolve(socket);
+      } else {
+        socket.destroy();
+        reject(new Error(`Claude Code relay proxy CONNECT failed with status ${response.statusCode}`));
+      }
+    });
+    request.once("timeout", () => {
+      request.destroy(new Error(`Claude Code relay proxy CONNECT timed out after ${timeoutMs}ms`));
+    });
+    request.once("error", reject);
+    request.end();
+  });
+}
 
 function copy<T>(value: T): T {
   return structuredClone(value);
@@ -157,6 +202,7 @@ export class TurnRelay {
     onEvent?: (event: AnthropicStreamEvent) => void,
     transformRequest?: (body: Buffer) => Buffer,
     requestBetas: string[] = [],
+    private readonly env: ProxyEnv = process.env,
   ) {
     this.upstream = new URL(upstream);
     const loopback = ["127.0.0.1", "::1", "localhost"].includes(this.upstream.hostname);
@@ -276,6 +322,8 @@ export class TurnRelay {
     this.sockets.add(response);
 
     let upstreamRequest: http.ClientRequest | undefined;
+    let upstreamAttempted = false;
+    let tunnel: net.Socket | undefined;
     try {
       let body = await this.readBody(request);
       this.originalRequestBody = Buffer.from(body);
@@ -302,16 +350,45 @@ export class TurnRelay {
       }
 
       const pathPrefix = this.upstream.pathname.replace(/\/$/u, "");
-      const transport = this.upstream.protocol === "https:" ? https : http;
-      upstreamRequest = transport.request({
-        protocol: this.upstream.protocol,
-        hostname: this.upstream.hostname,
-        port: this.upstream.port || undefined,
-        method: "POST",
-        path: `${pathPrefix}/v1/messages${requestUrl.search}`,
-        headers,
-        timeout: this.timeoutMs,
-      });
+      const proxy = resolveUpstreamProxy(this.env, this.upstream);
+      upstreamAttempted = true;
+      if (proxy) {
+        tunnel = await connectThroughProxy(proxy, this.upstream, this.timeoutMs);
+        this.sockets.add(tunnel);
+      }
+      // When tunneling through a proxy, send HTTP/1.1 over the TLS-wrapped
+      // tunnel socket via http.request: https.request ignores createConnection
+      // when agent is false, which silently bypasses the tunnel and connects
+      // directly (geo-blocked upstreams then answer 403 "Request not allowed").
+      const path = `${pathPrefix}/v1/messages${requestUrl.search}`;
+      const hostname = this.upstream.hostname;
+      const port = this.upstream.port || undefined;
+      if (tunnel) {
+        const tunnelSocket = tunnel;
+        upstreamRequest = http.request({
+          hostname,
+          port: port || (this.upstream.protocol === "https:" ? 443 : 80),
+          headers: { ...headers, host: this.upstream.host },
+          method: "POST",
+          path,
+          timeout: this.timeoutMs,
+          createConnection: () =>
+            this.upstream.protocol === "https:"
+              ? tls.connect({ socket: tunnelSocket, servername: hostname, ALPNProtocols: ["http/1.1"] })
+              : tunnelSocket,
+        });
+      } else {
+        const transport = this.upstream.protocol === "https:" ? https : http;
+        upstreamRequest = transport.request({
+          protocol: this.upstream.protocol,
+          hostname,
+          port,
+          method: "POST",
+          path,
+          headers,
+          timeout: this.timeoutMs,
+        });
+      }
       this.sockets.add(upstreamRequest);
 
       const upstreamResponse = await new Promise<http.IncomingMessage>((resolve, reject) => {
@@ -321,6 +398,7 @@ export class TurnRelay {
       });
       this.sockets.add(upstreamResponse);
       this.status = upstreamResponse.statusCode;
+
       this.requestId =
         String(upstreamResponse.headers["request-id"] ?? upstreamResponse.headers["x-request-id"] ?? "") || undefined;
 
@@ -343,11 +421,15 @@ export class TurnRelay {
       response.end();
     } catch (error) {
       this.failure = describeFailure(error);
-      this.upstreamFailed = upstreamRequest !== undefined && this.status === undefined && !this.cancelled;
+      this.upstreamFailed = upstreamAttempted && this.status === undefined && !this.cancelled;
       if (!response.headersSent) response.writeHead(this.cancelled ? 499 : 502).end();
       else response.destroy();
     } finally {
       if (upstreamRequest) this.sockets.delete(upstreamRequest);
+      if (tunnel) {
+        this.sockets.delete(tunnel);
+        tunnel.destroy();
+      }
       this.sockets.delete(request);
       this.sockets.delete(response);
       upstreamRequest?.destroy();

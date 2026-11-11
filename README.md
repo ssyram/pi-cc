@@ -1,4 +1,23 @@
-# pi-claude-code
+# pi-cc
+
+Local fork of [earendil-works/pi-claude-code](https://github.com/earendil-works/pi-claude-code),
+including the unmerged cache-prefix fix (PR #35, `381be31`) and explicit upstream proxy support.
+The provider ID remains `claude-code`. Install this fork **instead of** the upstream
+extension; do not enable both at once.
+
+## Proxy support
+
+Start Pi with your proxy environment already exported (for this machine: `source ~/cc-env.sh`).
+The relay uses `HTTPS_PROXY` / `https_proxy`, then `ALL_PROXY` / `all_proxy`,
+and honors `NO_PROXY` / `no_proxy` for the upstream hostname. The supported proxy
+scheme is `http://` using CONNECT for HTTPS; unsupported schemes fail explicitly.
+The local Claude-to-relay connection remains loopback, while the relay's upstream
+connection uses the proxy. It preserves the upstream HTTP Host and TLS server name.
+
+Validation: local HTTPS-through-CONNECT regression, plugin type check, and a real
+Pi/tmux Claude Code conversation succeeded. This does not guarantee future upstream
+billing behavior or support for SOCKS/HTTPS proxy schemes.
+
 
 This Pi extension lets you use your Claude Pro or Max subscription in Pi by
 routing all Claude model requests through the official Claude Code CLI.
@@ -38,7 +57,7 @@ execution. Claude Code only talks to the model. It never runs tools itself.
 ## Installation
 
 ```sh
-pi install https://github.com/earendil-works/pi-claude-code
+pi install https://github.com/ssyram/pi-cc
 ```
 
 Then pick a model from the **Claude Code Subscription (Experimental)** provider

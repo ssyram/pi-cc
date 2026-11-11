@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import * as http from "node:http";
+import * as net from "node:net";
 import test from "node:test";
-import { describeFailure, TurnRelay } from "../src/turn-relay.ts";
+import { connectThroughProxy, describeFailure, TurnRelay } from "../src/turn-relay.ts";
 
 function listen(server: http.Server): Promise<number> {
   return new Promise((resolve) => {
@@ -132,4 +133,90 @@ test("describes relay failures with their error code and nested errors", () => {
   );
   assert.equal(describeFailure(Object.assign(new Error(""), { code: "ECONNRESET" })), "Error (ECONNRESET)");
   assert.equal(describeFailure("nope"), "UnknownError");
+});
+
+test("http.request honors createConnection, so the proxy tunnel cannot be silently bypassed", async () => {
+  const upstream = http.createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end('data: {"type":"message_stop"}\n\n');
+  });
+  const upstreamPort = await new Promise<number>((resolve) => {
+    upstream.listen(0, "127.0.0.1", () => {
+      const address = upstream.address();
+      if (!address || typeof address === "string") throw new Error("missing address");
+      resolve(address.port);
+    });
+  });
+  try {
+    const response = await new Promise<http.IncomingMessage>((resolve, reject) => {
+      const request = http.request({
+        // TEST-NET: unreachable unless createConnection supplies the real socket.
+        hostname: "192.0.2.1",
+        method: "POST",
+        path: "/v1/messages",
+        timeout: 5_000,
+        createConnection: () => net.connect(upstreamPort, "127.0.0.1"),
+      });
+      request.once("response", resolve);
+      request.once("timeout", () => request.destroy(new Error("request timed out")));
+      request.once("error", reject);
+      request.end("{}");
+    });
+    assert.equal(response.statusCode, 200);
+    for await (const _chunk of response);
+  } finally {
+    upstream.close();
+    upstream.closeAllConnections?.();
+  }
+});
+
+test("tunnels a raw TCP connection through an HTTP CONNECT proxy", async () => {
+  const echo = net.createServer((socket) => socket.pipe(socket));
+  const echoPort = await new Promise<number>((resolve) => {
+    echo.listen(0, "127.0.0.1", () => {
+      const address = echo.address();
+      if (!address || typeof address === "string") throw new Error("missing address");
+      resolve(address.port);
+    });
+  });
+  const seen: string[] = [];
+  const proxy = http.createServer();
+  proxy.on("connect", (request, clientSocket, head) => {
+    seen.push(request.url ?? "");
+    const [host, port] = (request.url ?? "").split(":");
+    const upstream = net.connect(Number(port), host);
+    upstream.on("connect", () => {
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head.length > 0) upstream.write(head);
+      upstream.pipe(clientSocket);
+      clientSocket.pipe(upstream);
+    });
+    upstream.on("error", () => clientSocket.destroy());
+    clientSocket.on("error", () => upstream.destroy());
+  });
+  const proxyPort = await new Promise<number>((resolve) => {
+    proxy.listen(0, "127.0.0.1", () => {
+      const address = proxy.address();
+      if (!address || typeof address === "string") throw new Error("missing address");
+      resolve(address.port);
+    });
+  });
+  try {
+    const socket = await connectThroughProxy(
+      new URL(`http://127.0.0.1:${proxyPort}`),
+      new URL(`http://127.0.0.1:${echoPort}`),
+      5_000,
+    );
+    const reply = await new Promise<string>((resolve, reject) => {
+      socket.once("data", (chunk) => resolve(chunk.toString("utf8")));
+      socket.once("error", reject);
+      socket.write("ping");
+    });
+    assert.equal(reply, "ping");
+    assert.deepEqual(seen, [`127.0.0.1:${echoPort}`]);
+    socket.destroy();
+  } finally {
+    proxy.close();
+    echo.close();
+  }
 });

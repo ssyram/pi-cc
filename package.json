@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/earendil-works/pi-claude-code.git"
+    "url": "git+https://github.com/ssyram/pi-cc.git"
   },
   "publishConfig": {
     "access": "public"
